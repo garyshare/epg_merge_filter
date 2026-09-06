@@ -1,11 +1,12 @@
 name: Merge EPG
 
 on:
-  # Run automatically every day at 03:00 UTC
-  # schedule:
-  #   - cron: "17,47 * * * *"
+  # 定时全自动运行（GitHub 使用 UTC 时间）
+  # 每天北京时间 04:00 和 16:00 各自动抓取更新一次（UTC 20:00 和 08:00）
+  schedule:
+    - cron: "0 8,20 * * *"
 
-  # Allow manual triggering with optional overrides
+  # 保留手动触发按钮（随时想更新可以在网页上点 Run workflow）
   workflow_dispatch:
     inputs:
       m3u_url:
@@ -17,7 +18,7 @@ on:
         required: false
         default: "chrome"
 
-  # Also trigger when the script or workflow file is updated
+  # 当更新脚本或工作流文件时自动触发一次
   push:
     paths:
       - "scripts/epg.py"
@@ -27,7 +28,7 @@ jobs:
   merge-epg:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # required to commit the merged result back to the repo
+      contents: write # 赋予 Release 发布写入权限
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────
@@ -41,11 +42,6 @@ jobs:
           python-version: "3.14"
 
       # ── 3. Install dependencies ───────────────────────────────────────────
-      # curl-cffi (PyPI name uses a hyphen; imported as curl_cffi) links libcurl
-      # against BoringSSL to replicate Chrome JA3/JA4/HTTP2 fingerprints —
-      # the lightest option for bypassing Cloudflare Bot Management without a
-      # real browser. v0.15+ adds HTTP/3 fingerprint support.
-      # Python >=3.10 is required since v0.14.
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -57,28 +53,13 @@ jobs:
           MAX_WORKERS: "6"
           REQUEST_TIMEOUT: "60"
           IMPERSONATE: ${{ inputs.impersonate || 'chrome' }}
-
-          # Optional: Cloudflare Workers reverse proxy
-          # If curl_cffi alone is still blocked (e.g. CF JS Challenge is on),
-          # deploy cloudflare-worker/proxy.js and store the Worker URL as a secret:
-          #   CF_PROXY_URL = https://epg-proxy.your-name.workers.dev/proxy
-          # The script will route all requests through the Worker, which runs
-          # on CF edge nodes and is never blocked by CF itself.
           CF_PROXY_URL: ${{ secrets.CF_PROXY_URL }}
 
         run: |
           echo "MERGE_TIME=$(TZ='Asia/Shanghai' date +"%Y-%m-%dT%H:%M:%S%z")" >> $GITHUB_ENV
           python scripts/epg.py
 
-      # ── 5. Upload artifact ────────────────────────────────────────────────
-      # - name: Upload merged EPG as artifact
-      #   uses: actions/upload-artifact@v7
-      #   with:
-      #     name: merged-epg-${{ github.run_number }}
-      #     path: output/merged_epg.xml.gz
-      #     retention-days: 30
-
-      # ── 6. Commit result to repository ───────────────────────────────────
+      # ── 5. Update latest tag ──────────────────────────────────────────────
       - name: Update latest tag
         run: |
           git config user.name  "github-actions[bot]"
@@ -86,9 +67,9 @@ jobs:
           git tag -fa latest -m latest
           git push origin latest --force
 
-      # ── 7. publish as a Release asset ───────────────────────────
-      # expose the merged EPG at a stable, permanent URL:
-      #   https://github.com/iwinstar/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
+      # ── 6. Publish as a Release asset ─────────────────────────────────────
+      # 发布到永久下载地址:
+      #   https://github.com/garyshare/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
       - name: Publish Release
         uses: softprops/action-gh-release@v3
         with:
