@@ -17,7 +17,7 @@ Fetches EPG (XMLTV) sources declared in an M3U playlist, merges them into a sing
 The latest merged EPG is always available at:
 
 ```
-https://github.com/iwinstar/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
+https://github.com/garyshare/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
 ```
 
 ## Configuration
