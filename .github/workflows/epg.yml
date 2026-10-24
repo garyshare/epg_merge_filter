@@ -21,7 +21,9 @@ on:
 
   # 当更新脚本或工作流文件时自动触发一次
   push:
-    paths:
+     branches:
+       - main
+     paths:
       - "scripts/epg.py"
       - ".github/workflows/epg.yml"
 
