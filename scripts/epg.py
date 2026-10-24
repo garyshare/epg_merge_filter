@@ -29,14 +29,17 @@ import certifi
 import gzip
 import logging
 import os
+import random
 import re
 import sys
 import tempfile
+import time
+import zlib
 
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -100,6 +103,10 @@ REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 CF_PROXY_URL = os.environ.get("CF_PROXY_URL", "").rstrip("/")
 IMPERSONATE = os.environ.get("IMPERSONATE", "chrome")
 RELEASE_LOG = os.environ.get("RELEASE_LOG", "output/release_notes.md")
+RETRIES = int(os.environ.get("RETRIES", "3"))  # attempts per download
+MIN_OK_RATIO = float(os.environ.get("MIN_OK_RATIO", "0.75"))  # below this, do not publish
+CHECK_LOGOS = os.environ.get("CHECK_LOGOS", "1") != "0"
+NOTES_MAX_CHARS = 120_000  # GitHub release body limit is 125,000
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -111,6 +118,19 @@ def _proxied(url: str) -> str:
     if CF_PROXY_URL:
         return f"{CF_PROXY_URL}?url={quote(url, safe='')}"
     return url
+
+
+def with_retry(fn, *args, what: str = ""):
+    """Call fn(*args), retrying transient failures with exponential backoff + jitter."""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return fn(*args)
+        except Exception as exc:
+            if attempt == RETRIES:
+                raise
+            delay = 2**attempt + random.random()
+            log.warning(f"  retry {attempt}/{RETRIES - 1} [{what}]: {exc} (sleep {delay:.0f}s)")
+            time.sleep(delay)
 
 
 def fetch_bytes(url: str) -> bytes:
@@ -200,7 +220,7 @@ def fetch_to_file(url: str) -> Path:
 
 
 def fetch_text(url: str) -> str:
-    data = fetch_bytes(url)
+    data = with_retry(fetch_bytes, url, what="M3U")
     try:
         return data.decode("utf-8").lstrip("\ufeff")
     except UnicodeDecodeError:
@@ -322,10 +342,12 @@ def check_logo_url(url: str) -> tuple[bool, str]:
                 impersonate=IMPERSONATE,
                 timeout=REQUEST_TIMEOUT,
                 verify=BUNDLE_PATH,
+                stream=True,  # headers only; body is never read
             )
         else:
             resp = cf_requests.get(
                 target, headers=headers, timeout=REQUEST_TIMEOUT, verify=BUNDLE_PATH,
+                stream=True,
             )
         status = resp.status_code
         return status < 400, str(status)
@@ -386,6 +408,7 @@ class EpgDownloadResult:
     channels: int = 0
     programmes: int = 0
     error: str | None = None
+    partial: bool = False
 
     @property
     def ok(self) -> bool:
@@ -404,59 +427,85 @@ def parse_epg_file(path: Path, url: str, tvg_ids: set[str]) -> EpgDownloadResult
     programmes = 0
     source_root: ET.Element | None = None
 
-    input_file = gzip.open(path, "rb") if is_gzip_file(path) else path.open("rb")
-    with input_file as source:
-        for event, elem in ET.iterparse(source, events=("start", "end")):
-            if event == "start" and source_root is None:
-                source_root = elem
-                for attr, val in elem.attrib.items():
-                    filtered.set(attr, val)
-                continue
+    partial_error: str | None = None
+    try:
+        input_file = gzip.open(path, "rb") if is_gzip_file(path) else path.open("rb")
+        with input_file as source:
+            for event, elem in ET.iterparse(source, events=("start", "end")):
+                if event == "start" and source_root is None:
+                    source_root = elem
+                    for attr, val in elem.attrib.items():
+                        filtered.set(attr, val)
+                    continue
 
-            if event != "end":
-                continue
+                if event != "end":
+                    continue
 
-            if elem.tag == "channel":
-                channels += 1
-                cid = elem.get("id", "").strip()
-                if cid in tvg_ids:
-                    filtered.append(deepcopy(elem))
-                elem.clear()
-                if source_root is not None:
-                    source_root.clear()
-            elif elem.tag == "programme":
-                programmes += 1
-                channel = elem.get("channel", "").strip()
-                if channel in tvg_ids:
-                    filtered.append(deepcopy(elem))
-                elem.clear()
-                if source_root is not None:
-                    source_root.clear()
+                if elem.tag == "channel":
+                    channels += 1
+                    cid = elem.get("id", "").strip()
+                    if cid in tvg_ids:
+                        filtered.append(deepcopy(elem))
+                    elem.clear()
+                    if source_root is not None:
+                        source_root.clear()
+                elif elem.tag == "programme":
+                    programmes += 1
+                    channel = elem.get("channel", "").strip()
+                    if channel in tvg_ids:
+                        filtered.append(deepcopy(elem))
+                    elem.clear()
+                    if source_root is not None:
+                        source_root.clear()
+    except (ET.ParseError, EOFError, OSError, zlib.error) as exc:
+        # Truncated download or a stray bad byte: keep everything parsed so far.
+        partial_error = f"{type(exc).__name__}: {exc}"
 
+    if partial_error:
+        if channels + programmes == 0:
+            raise RuntimeError(partial_error)
+        return EpgDownloadResult(
+            url, filtered, channels, programmes, error=partial_error, partial=True
+        )
     return EpgDownloadResult(url, filtered, channels, programmes)
 
 
 def download_epg(url: str, tvg_ids: set[str]) -> EpgDownloadResult:
-    """Download and stream-parse a single EPG XML."""
-    tmp_path: Path | None = None
-    try:
-        log.info(f"Downloading EPG: {url}")
-        tmp_path = fetch_to_file(url)
-        result = parse_epg_file(tmp_path, url, tvg_ids)
-        log.info(
-            f"  OK {url} — channels: {result.channels}  programmes: {result.programmes}"
-        )
-        return result
-    except Exception as exc:
-        log.warning(f"  FAILED [{url}]: {exc}")
-        return EpgDownloadResult(url, error=str(exc))
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+    """
+    Download and stream-parse one EPG XML, retrying transient failures.
+    A truncated/corrupt download counts as a failed attempt; if no attempt is
+    complete, the most complete partial result is returned instead of nothing.
+    """
+    best: EpgDownloadResult | None = None
+    last_error = "unknown error"
+    for attempt in range(1, RETRIES + 1):
+        tmp_path: Path | None = None
+        try:
+            log.info(f"Downloading EPG ({attempt}/{RETRIES}): {url}")
+            tmp_path = fetch_to_file(url)
+            result = parse_epg_file(tmp_path, url, tvg_ids)
+            if not result.partial:
+                log.info(
+                    f"  OK {url} — channels: {result.channels}  programmes: {result.programmes}"
+                )
+                return result
+            last_error = result.error or last_error
+            if best is None or result.programmes > best.programmes:
+                best = result
+            log.warning(f"  PARTIAL [{url}]: {last_error}")
+        except Exception as exc:
+            last_error = str(exc)
+            log.warning(f"  FAILED [{url}] attempt {attempt}: {exc}")
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+        if attempt < RETRIES:
+            time.sleep(2**attempt + random.random())
+    return best if best is not None else EpgDownloadResult(url, error=last_error)
 
 
 def write_epg_source_notes(results: list[EpgDownloadResult]) -> None:
-    ok_count = sum(1 for result in results if result.ok)
+    ok_count = sum(1 for result in results if result.ok and not result.partial)
     epg_source_summary = [
         "## EPG Sources",
         f"### Summary ({ok_count}/{len(results)} OK)",
@@ -466,7 +515,11 @@ def write_epg_source_notes(results: list[EpgDownloadResult]) -> None:
     release_note("\n".join(epg_source_summary))
 
     for result in results:
-        if result.ok:
+        if result.partial:
+            release_note(
+                f"| {result.url} | PARTIAL: {result.error} | {result.channels} | {result.programmes} |"
+            )
+        elif result.ok:
             release_note(
                 f"| {result.url} | OK | {result.channels} | {result.programmes} |"
             )
@@ -474,12 +527,35 @@ def write_epg_source_notes(results: list[EpgDownloadResult]) -> None:
             release_note(f"| {result.url} | {result.error} | - | - |")
 
 
-def programme_key(prog: ET.Element) -> tuple[str, str, str] | tuple[str, str]:
+_XMLTV_TS = re.compile(
+    r"^(\d{4})(\d{2})(\d{2})(\d{2})?(\d{2})?(\d{2})?\s*([+-]\d{4})?$"
+)
+
+
+def to_utc(ts: str) -> str:
+    """Normalise an XMLTV timestamp to UTC 'YYYYMMDDhhmmss'; unparsable input is returned as-is."""
+    m = _XMLTV_TS.match(ts.strip())
+    if not m:
+        return ts
+    y, mo, d, h, mi, s, tz = m.groups()
+    try:
+        dt = datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(s or 0))
+    except ValueError:
+        return ts
+    if tz:
+        sign = -1 if tz[0] == "-" else 1
+        dt -= timedelta(minutes=sign * (int(tz[1:3]) * 60 + int(tz[3:5])))
+    return dt.strftime("%Y%m%d%H%M%S")
+
+
+def programme_key(prog: ET.Element) -> tuple[str, str]:
+    """A channel cannot start two programmes at the same instant, so (channel, UTC start)
+    is the identity. Sources that disagree on the stop time or time-zone notation
+    no longer produce duplicate/overlapping entries; the first source wins."""
     channel = prog.get("channel", "").strip()
-    start = prog.get("start", "").strip()
-    stop = prog.get("stop", "").strip()
+    start = to_utc(prog.get("start", "").strip())
     if channel and start:
-        return channel, start, stop
+        return channel, start
     return channel, ET.tostring(prog, encoding="unicode")
 
 
@@ -677,6 +753,23 @@ def release_note(content: str, path: str = RELEASE_LOG):
         f.write(content + "\n")
 
 
+def cap_release_notes(path: str = RELEASE_LOG, limit: int = NOTES_MAX_CHARS) -> None:
+    """GitHub rejects release bodies over 125,000 chars; trim at a line boundary."""
+    file_path = Path(path)
+    if file_path.suffix != ".md":
+        file_path = file_path.with_suffix(".md")
+    if not file_path.exists():
+        return
+    text = file_path.read_text(encoding="utf-8")
+    if len(text) <= limit:
+        return
+    cut = text.rfind("\n", 0, limit)
+    file_path.write_text(
+        text[: cut if cut > 0 else limit] + "\n\n> … truncated (release body size limit).\n",
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -687,6 +780,8 @@ def main() -> int:
         log.error("M3U_URL environment variable is not set")
         return 1
 
+    Path(RELEASE_LOG).unlink(missing_ok=True)  # do not accumulate notes across local runs
+
     if not HAS_CURL_CFFI:
         log.warning("Install curl_cffi for Cloudflare bypass: pip install curl_cffi")
 
@@ -694,7 +789,8 @@ def main() -> int:
     m3u_text = fetch_text(M3U_URL)
     epg_urls, tvg_ids, tvg_logos = parse_m3u(m3u_text)
 
-    check_tvg_logos(tvg_logos)
+    if CHECK_LOGOS:
+        check_tvg_logos(tvg_logos)
 
     if not epg_urls:
         log.error("No EPG URLs found in M3U (url-tvg / x-tvg-url)")
@@ -710,6 +806,12 @@ def main() -> int:
     results = [results_by_url[url] for url in epg_urls]
     write_epg_source_notes(results)
 
+    fully_ok = sum(1 for r in results if r.ok and not r.partial)
+    if fully_ok / len(results) < MIN_OK_RATIO:
+        # Non-zero exit makes the later workflow steps skip, so the last good release stays online.
+        log.error(f"Only {fully_ok}/{len(results)} EPG sources fully OK (< {MIN_OK_RATIO:.0%}); not publishing a degraded EPG")
+        return 1
+
     roots = [result.root for result in results if result.root is not None]
 
     if not roots:
@@ -722,6 +824,7 @@ def main() -> int:
     log.info(f"Icon URLs upgraded: {upgraded}")
 
     write_xml(merged, OUTPUT_PATH)
+    cap_release_notes()
     return 0
 
 
