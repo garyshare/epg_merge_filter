@@ -19,8 +19,11 @@ on:
         required: false
         default: "chrome"
 
-  # 当更新脚本或工作流文件时自动触发一次
+  # 当 main 分支上的脚本或工作流文件更新时自动触发一次
+  # （限定 main：其他分支的推送不会触发运行，也就不会覆盖正式发布的 Release）
   push:
+    branches:
+      - main
     paths:
       - "scripts/epg.py"
       - ".github/workflows/epg.yml"
