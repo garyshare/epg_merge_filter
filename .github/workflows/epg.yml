@@ -4,7 +4,8 @@ on:
   # 定时全自动运行（GitHub 使用 UTC 时间）
   # 每天北京时间 04:00 和 16:00 各自动抓取更新一次（UTC 20:00 和 08:00）
   schedule:
-    - cron: "0 8,20 * * *"
+    # 分钟数错开整点：GitHub 在整点高峰会延迟甚至丢弃定时任务
+    - cron: "17 8,20 * * *"
 
   # 保留手动触发按钮（随时想更新可以在网页上点 Run workflow）
   workflow_dispatch:
@@ -27,6 +28,10 @@ on:
 jobs:
   merge-epg:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: merge-epg
+      cancel-in-progress: false
     permissions:
       contents: write # 赋予 Release 发布写入权限
 
@@ -40,6 +45,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+          cache: pip
 
       # ── 3. Install dependencies ───────────────────────────────────────────
       - name: Install dependencies
@@ -58,6 +64,12 @@ jobs:
         run: |
           echo "MERGE_TIME=$(TZ='Asia/Shanghai' date +"%Y-%m-%dT%H:%M:%S%z")" >> $GITHUB_ENV
           python scripts/epg.py
+
+      # 失败时也把 release notes 写进运行摘要，方便排查哪个源出了问题
+      - name: Job summary
+        if: always()
+        run: |
+          [ -f output/release_notes.md ] && cat output/release_notes.md >> "$GITHUB_STEP_SUMMARY" || true
 
       # ── 5. Update latest tag ──────────────────────────────────────────────
       - name: Update latest tag
