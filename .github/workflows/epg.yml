@@ -2,10 +2,9 @@ name: Merge EPG
 
 on:
   # 定时全自动运行（GitHub 使用 UTC 时间）
-  # 每天北京时间 04:00 和 16:00 各自动抓取更新一次（UTC 20:00 和 08:00）
   schedule:
     # 分钟数错开整点：GitHub 在整点高峰会延迟甚至丢弃定时任务
-    - cron: "17 8,20 * * *"
+    - cron: "17 * * * *"
 
   # 保留手动触发按钮（随时想更新可以在网页上点 Run workflow）
   workflow_dispatch:
@@ -26,6 +25,7 @@ on:
       - main
     paths:
       - "scripts/epg.py"
+      - "scripts/publish_release.sh"
       - ".github/workflows/epg.yml"
 
 jobs:
@@ -54,6 +54,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run regression tests
+        run: python -B -m unittest discover -s tests
+
       # ── 4. Run the merger ─────────────────────────────────────────────────
       - name: Run EPG merger
         env:
@@ -61,6 +64,8 @@ jobs:
           OUTPUT_PATH: output/merged_epg.xml.gz
           MAX_WORKERS: "6"
           REQUEST_TIMEOUT: "60"
+          LOGO_CHECK_TIMEOUT: "30"
+          LOGO_REQUEST_TIMEOUT: "5"
           IMPERSONATE: ${{ inputs.impersonate || 'chrome' }}
           CF_PROXY_URL: ${{ secrets.CF_PROXY_URL }}
 
@@ -74,22 +79,7 @@ jobs:
         run: |
           [ -f output/release_notes.md ] && cat output/release_notes.md >> "$GITHUB_STEP_SUMMARY" || true
 
-      # ── 5. Update latest tag ──────────────────────────────────────────────
-      - name: Update latest tag
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa latest -m latest
-          git push origin latest --force
-
-      # ── 6. Publish as a Release asset ─────────────────────────────────────
-      # 发布到永久下载地址:
-      #   https://github.com/garyshare/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
       - name: Publish Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: latest
-          make_latest: true
-          name: Merged EPG @ ${{ env.MERGE_TIME }}
-          body_path: output/release_notes.md
-          files: output/merged_epg.xml.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/publish_release.sh

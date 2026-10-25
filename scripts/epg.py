@@ -12,7 +12,7 @@ Environment variables:
     MAX_WORKERS     Optional. Concurrent download threads (default: 6).
     REQUEST_TIMEOUT Optional. Per-request timeout in seconds (default: 30).
     CF_PROXY_URL    Optional. Cloudflare Workers reverse-proxy prefix.
-                    Example: https://epg-proxy.your-name.workers.dev/proxy?url=
+                    Example: https://epg-proxy.your-name.workers.dev/proxy
     IMPERSONATE     Optional. Browser fingerprint to impersonate (default: "chrome").
                     Use a bare alias to always track the latest fingerprint:
                       chrome        latest Chrome (recommended)
@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import certifi
 import gzip
+import json
 import logging
 import os
 import random
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -38,10 +40,11 @@ import zlib
 
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
 
 # root ca for *.samsungcloud.tv
@@ -100,12 +103,14 @@ M3U_URL = os.environ.get("M3U_URL", "")
 OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "output/merged_epg.xml.gz")
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-CF_PROXY_URL = os.environ.get("CF_PROXY_URL", "").rstrip("/")
+CF_PROXY_URL = os.environ.get("CF_PROXY_URL", "")
 IMPERSONATE = os.environ.get("IMPERSONATE", "chrome")
 RELEASE_LOG = os.environ.get("RELEASE_LOG", "output/release_notes.md")
 RETRIES = int(os.environ.get("RETRIES", "3"))  # attempts per download
 MIN_OK_RATIO = float(os.environ.get("MIN_OK_RATIO", "0.75"))  # below this, do not publish
 CHECK_LOGOS = os.environ.get("CHECK_LOGOS", "1") != "0"
+LOGO_CHECK_TIMEOUT = float(os.environ.get("LOGO_CHECK_TIMEOUT", "30"))
+LOGO_REQUEST_TIMEOUT = min(REQUEST_TIMEOUT, float(os.environ.get("LOGO_REQUEST_TIMEOUT", "5")))
 NOTES_MAX_CHARS = 120_000  # GitHub release body limit is 125,000
 
 # ---------------------------------------------------------------------------
@@ -113,10 +118,21 @@ NOTES_MAX_CHARS = 120_000  # GitHub release body limit is 125,000
 # ---------------------------------------------------------------------------
 
 
+class EpgValidationError(ValueError):
+    pass
+
+
+def error_detail(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _proxied(url: str) -> str:
     """Wrap the target URL through the Workers reverse proxy if configured."""
     if CF_PROXY_URL:
-        return f"{CF_PROXY_URL}?url={quote(url, safe='')}"
+        parts = urlsplit(CF_PROXY_URL)
+        query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "url"]
+        query.append(("url", url))
+        return urlunsplit(parts._replace(query=urlencode(query)))
     return url
 
 
@@ -129,7 +145,7 @@ def with_retry(fn, *args, what: str = ""):
             if attempt == RETRIES:
                 raise
             delay = 2**attempt + random.random()
-            log.warning(f"  retry {attempt}/{RETRIES - 1} [{what}]: {exc} (sleep {delay:.0f}s)")
+            log.warning(f"  retry {attempt}/{RETRIES - 1} [{what}]: {error_detail(exc)} (sleep {delay:.0f}s)")
             time.sleep(delay)
 
 
@@ -172,8 +188,11 @@ def fetch_bytes(url: str) -> bytes:
             **kwargs,
         )
 
-    resp.raise_for_status()
-    data = resp.content
+    try:
+        resp.raise_for_status()
+        data = resp.content
+    finally:
+        resp.close()
     # Some servers declare Content-Encoding but skip actual decompression
     if data[:2] == b"\x1f\x8b":
         data = gzip.decompress(data)
@@ -205,17 +224,22 @@ def fetch_to_file(url: str) -> Path:
         )
         resp = cf_requests.get(target, headers=headers, stream=True, **kwargs)
 
-    resp.raise_for_status()
-
-    with tempfile.NamedTemporaryFile(prefix="epg_", suffix=".xml", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-        if hasattr(resp, "iter_content"):
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    tmp.write(chunk)
-        else:
-            tmp.write(resp.content)
-
+    tmp_path = None
+    try:
+        with closing(resp):
+            resp.raise_for_status()
+            with tempfile.NamedTemporaryFile(prefix="epg_", suffix=".xml", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+                if hasattr(resp, "iter_content"):
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            tmp.write(chunk)
+                else:
+                    tmp.write(resp.content)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
     return tmp_path
 
 
@@ -340,19 +364,19 @@ def check_logo_url(url: str) -> tuple[bool, str]:
                 target,
                 headers=headers,
                 impersonate=IMPERSONATE,
-                timeout=REQUEST_TIMEOUT,
+                timeout=LOGO_REQUEST_TIMEOUT,
                 verify=BUNDLE_PATH,
                 stream=True,  # headers only; body is never read
             )
         else:
             resp = cf_requests.get(
-                target, headers=headers, timeout=REQUEST_TIMEOUT, verify=BUNDLE_PATH,
+                target, headers=headers, timeout=LOGO_REQUEST_TIMEOUT, verify=BUNDLE_PATH,
                 stream=True,
             )
         status = resp.status_code
         return status < 400, str(status)
     except Exception as exc:
-        return False, str(exc)
+        return False, error_detail(exc)
     finally:
         if resp is not None and hasattr(resp, "close"):
             resp.close()
@@ -396,6 +420,32 @@ def check_tvg_logos(tvg_logos: list[tuple[str, str]]) -> None:
             release_note(f"- {names_str}: {url} ({detail})")
 
 
+def check_tvg_logos_bounded(tvg_logos: list[tuple[str, str]]) -> None:
+    if not tvg_logos or LOGO_CHECK_TIMEOUT <= 0:
+        return
+    with tempfile.TemporaryDirectory(prefix="epg_logos_") as directory:
+        input_path = Path(directory) / "logos.json"
+        notes_path = Path(directory) / "logos.md"
+        input_path.write_text(json.dumps(tvg_logos), encoding="utf-8")
+        env = dict(os.environ, RELEASE_LOG=str(notes_path))
+        try:
+            subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--check-logos", str(input_path)],
+                env=env,
+                timeout=LOGO_CHECK_TIMEOUT,
+                check=True,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Logo check exceeded its time budget; continuing with the merged EPG")
+            release_note("## Logo Check\n> Time budget exceeded; logo availability was not fully checked.")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            log.warning(f"Logo check could not complete: {error_detail(exc)}")
+            release_note("## Logo Check\n> Logo availability check failed; EPG generation succeeded.")
+        else:
+            if notes_path.exists():
+                release_note(notes_path.read_text(encoding="utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # EPG download & merge
 # ---------------------------------------------------------------------------
@@ -433,6 +483,8 @@ def parse_epg_file(path: Path, url: str, tvg_ids: set[str]) -> EpgDownloadResult
         with input_file as source:
             for event, elem in ET.iterparse(source, events=("start", "end")):
                 if event == "start" and source_root is None:
+                    if elem.tag != "tv":
+                        raise EpgValidationError("EPG root element must be <tv>")
                     source_root = elem
                     for attr, val in elem.attrib.items():
                         filtered.set(attr, val)
@@ -463,10 +515,12 @@ def parse_epg_file(path: Path, url: str, tvg_ids: set[str]) -> EpgDownloadResult
 
     if partial_error:
         if channels + programmes == 0:
-            raise RuntimeError(partial_error)
+            raise EpgValidationError(partial_error)
         return EpgDownloadResult(
             url, filtered, channels, programmes, error=partial_error, partial=True
         )
+    if channels + programmes == 0:
+        raise EpgValidationError("EPG contains no channels or programmes")
     return EpgDownloadResult(url, filtered, channels, programmes)
 
 
@@ -494,8 +548,8 @@ def download_epg(url: str, tvg_ids: set[str]) -> EpgDownloadResult:
                 best = result
             log.warning(f"  PARTIAL [{url}]: {last_error}")
         except Exception as exc:
-            last_error = str(exc)
-            log.warning(f"  FAILED [{url}] attempt {attempt}: {exc}")
+            last_error = error_detail(exc)
+            log.warning(f"  FAILED [{url}] attempt {attempt}: {last_error}")
         finally:
             if tmp_path is not None:
                 tmp_path.unlink(missing_ok=True)
@@ -743,8 +797,8 @@ def write_xml(root: ET.Element, path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def release_note(content: str, path: str = RELEASE_LOG):
-    file_path = Path(path)
+def release_note(content: str, path: str | None = None):
+    file_path = Path(path or RELEASE_LOG)
     if file_path.suffix != ".md":
         file_path = file_path.with_suffix(".md")
 
@@ -753,9 +807,9 @@ def release_note(content: str, path: str = RELEASE_LOG):
         f.write(content + "\n")
 
 
-def cap_release_notes(path: str = RELEASE_LOG, limit: int = NOTES_MAX_CHARS) -> None:
+def cap_release_notes(path: str | None = None, limit: int = NOTES_MAX_CHARS) -> None:
     """GitHub rejects release bodies over 125,000 chars; trim at a line boundary."""
-    file_path = Path(path)
+    file_path = Path(path or RELEASE_LOG)
     if file_path.suffix != ".md":
         file_path = file_path.with_suffix(".md")
     if not file_path.exists():
@@ -786,14 +840,19 @@ def main() -> int:
         log.warning("Install curl_cffi for Cloudflare bypass: pip install curl_cffi")
 
     log.info(f"Fetching M3U: {M3U_URL}")
-    m3u_text = fetch_text(M3U_URL)
+    try:
+        m3u_text = fetch_text(M3U_URL)
+    except Exception as exc:
+        log.error(f"Could not fetch M3U: {error_detail(exc)}")
+        return 1
     epg_urls, tvg_ids, tvg_logos = parse_m3u(m3u_text)
-
-    if CHECK_LOGOS:
-        check_tvg_logos(tvg_logos)
 
     if not epg_urls:
         log.error("No EPG URLs found in M3U (url-tvg / x-tvg-url)")
+        return 1
+
+    if not tvg_ids:
+        log.error("No non-empty tvg-id values found in M3U")
         return 1
 
     results_by_url: dict[str, EpgDownloadResult] = {}
@@ -820,13 +879,32 @@ def main() -> int:
 
     merged = merge_epg(roots, tvg_ids)
 
+    channel_ids = {channel.get("id", "").strip() for channel in merged.findall("channel")}
+    if not channel_ids or not any(
+        programme.get("channel", "").strip() in channel_ids
+        for programme in merged.findall("programme")
+    ):
+        message = "Merged EPG has no matched channels with programmes; not publishing"
+        log.error(message)
+        release_note(f"## Publication Blocked\n> {message}")
+        return 1
+
     upgraded = upgrade_icon_urls(merged)
     log.info(f"Icon URLs upgraded: {upgraded}")
 
     write_xml(merged, OUTPUT_PATH)
+    if CHECK_LOGOS:
+        check_tvg_logos_bounded(tvg_logos)
     cap_release_notes()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == "--check-logos":
+            check_tvg_logos(json.loads(Path(sys.argv[2]).read_text(encoding="utf-8")))
+            sys.exit(0)
+        sys.exit(main())
+    except Exception as exc:
+        log.error(f"EPG processing failed: {error_detail(exc)}")
+        sys.exit(1)
