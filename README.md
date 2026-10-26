@@ -43,7 +43,7 @@ The original M3U parsing rules are preserved: EPG source attributes are read fro
 The workflow (`Merge EPG`) can be triggered three ways:
 
 - **Push** — automatically on `main` commits that modify `scripts/epg.py`, `scripts/publish_release.sh`, or `.github/workflows/epg.yml`.
-- **Schedule** — runs every hour at minute 17, approximately 720 scheduled runs per 30-day month.
+- **Schedule** — runs every 4 hours at minute 17 (UTC 00:17, 04:17, … 20:17), approximately 180 scheduled runs per 30-day month.
 - **Manual** — use *Actions → Merge EPG → Run workflow*, optionally overriding `m3u_url` and `impersonate`.
 
 ## Requirements
