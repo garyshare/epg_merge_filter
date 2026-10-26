@@ -47,6 +47,8 @@ The workflow (`Merge EPG`) can be triggered three ways:
 - **Schedule** — runs every 4 hours at minute 17 (UTC 00:17, 04:17, … 20:17), approximately 180 scheduled runs per 30-day month.
 - **Manual** — use *Actions → Merge EPG → Run workflow*, optionally overriding `m3u_url` and `impersonate`.
 
+Every run on `main` re-enables the `Merge EPG` and `Cleanup` workflows through the GitHub API, so GitHub does not disable their schedules after 60 days without commits.
+
 ## Requirements
 
 - Python ≥ 3.10 (workflow uses 3.14)

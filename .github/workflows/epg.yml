@@ -37,6 +37,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write # 赋予 Release 发布写入权限
+      actions: write
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────
@@ -83,3 +84,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/publish_release.sh
+
+      - name: Keep scheduled workflows enabled
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for workflow in epg.yml cleanup.yml; do
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"
+          done
