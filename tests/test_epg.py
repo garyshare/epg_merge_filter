@@ -266,6 +266,8 @@ class ReleaseTests(unittest.TestCase):
             '  printf "%s\\n" "$*" >> "$GH_CALLS"\n'
             '  if [ "${GH_FAIL:-}" = "$2" ]; then return 9; fi\n'
             '  if [ "$2" = edit ]; then printf "%s" "$3" > "$GH_STATE"; fi\n'
+            '  if [ "$2" = list ]; then printf "%s\\n" epg-90-1 epg-100-2 latest; fi\n'
+            '  if [ "$1" = api ] && [ "$2" = --paginate ]; then printf "%s\\n" refs/tags/epg-80-1 refs/tags/epg-100-2 refs/tags/latest; fi\n'
             '}\n'
         )
         self.script = Path(__file__).resolve().parents[1] / "scripts/publish_release.sh"
@@ -289,11 +291,20 @@ class ReleaseTests(unittest.TestCase):
         result = self.publish(attempt="2")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text().splitlines()
-        self.assertEqual([call.split()[1] for call in calls], ["create", "upload", "edit"])
+        self.assertEqual([call.split()[1] for call in calls[:3]], ["create", "upload", "edit"])
         self.assertIn("--draft", calls[0])
         self.assertNotIn("--latest", calls[0])
         self.assertIn("--draft=false --latest", calls[2])
         self.assertEqual(self.state.read_text(), "epg-100-2")
+        deleted = [call for call in calls if call.startswith("release delete")]
+        self.assertEqual([call.split()[2] for call in deleted], ["epg-90-1", "latest"])
+        removed = [call.split()[-1] for call in calls if call.startswith("api -X DELETE")]
+        self.assertEqual(removed, ["repos/review/example/git/refs/tags/epg-80-1", "repos/review/example/git/refs/tags/latest"])
+
+    def test_cleanup_failure_happens_after_new_release_is_live(self):
+        result = self.publish(failure="delete")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state.read_text(), "epg-100-1")
 
     def test_create_and_upload_failures_preserve_previous_release(self):
         for failure, expected in (("create", ["create"]), ("upload", ["create", "upload"])):
