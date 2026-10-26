@@ -10,7 +10,7 @@ Fetches EPG (XMLTV) sources declared in an M3U playlist, merges them into a sing
 1. **Parse M3U** — reads `url-tvg` / `tvg-id` attributes from an M3U playlist supplied via the `M3U_URL` secret (or a manual override).
 2. **Fetch EPG sources concurrently** — downloads each XMLTV URL in parallel (configurable worker count and timeout) using [`curl-cffi`](https://github.com/lexiforest/curl_cffi), which replicates a real browser's TLS/HTTP2 fingerprint to bypass Cloudflare Bot Management without a headless browser.
 3. **Merge & deduplicate** — combines `<channel>` and `<programme>` elements across all sources, dropping duplicates keyed on channel ID.
-4. **Validate & publish** — refuses to publish an empty guide, then uploads `output/merged_epg.xml.gz` to a new draft Release. Only a successful upload is published and marked as latest, preserving the previous download when an upload fails. Failed uploads may leave a draft for inspection.
+4. **Validate & publish** — refuses to publish an empty guide, then uploads `output/merged_epg.xml.gz` to a new draft Release. Only a successful upload is published and marked as latest, preserving the previous download when an upload fails. After publishing, every other release (including drafts left by failed uploads) and every other tag is deleted, so only one release and one tag exist at any time.
 
 ## Download
 

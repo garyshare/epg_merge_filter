@@ -25,3 +25,15 @@ gh release edit "$release_tag" \
   --repo "$GITHUB_REPOSITORY" \
   --draft=false \
   --latest
+
+gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' |
+  while read -r tag; do
+    [ -n "$tag" ] && [ "$tag" != "$release_tag" ] || continue
+    gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+  done
+
+gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" --jq '.[].ref' |
+  while read -r ref; do
+    [ -n "$ref" ] && [ "$ref" != "refs/tags/${release_tag}" ] || continue
+    gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/${ref}"
+  done
