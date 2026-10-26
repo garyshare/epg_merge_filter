@@ -38,6 +38,8 @@ import tempfile
 import time
 import zlib
 
+from bisect import bisect_right
+
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
@@ -111,6 +113,7 @@ MIN_OK_RATIO = float(os.environ.get("MIN_OK_RATIO", "0.75"))  # below this, do n
 CHECK_LOGOS = os.environ.get("CHECK_LOGOS", "1") != "0"
 LOGO_CHECK_TIMEOUT = float(os.environ.get("LOGO_CHECK_TIMEOUT", "30"))
 LOGO_REQUEST_TIMEOUT = min(REQUEST_TIMEOUT, float(os.environ.get("LOGO_REQUEST_TIMEOUT", "5")))
+PREFERRED_EPG_HOST = os.environ.get("PREFERRED_EPG_HOST", "epgshare01.online").lower()
 NOTES_MAX_CHARS = 120_000  # GitHub release body limit is 125,000
 
 # ---------------------------------------------------------------------------
@@ -613,6 +616,40 @@ def programme_key(prog: ET.Element) -> tuple[str, str]:
     return channel, ET.tostring(prog, encoding="unicode")
 
 
+def programme_span(prog: ET.Element) -> tuple[str, str] | None:
+    start = to_utc(prog.get("start", "").strip())
+    stop = to_utc(prog.get("stop", "").strip())
+    if len(start) != 14 or not start.isdigit():
+        return None
+    if len(stop) != 14 or not stop.isdigit() or stop <= start:
+        stop = start
+    return start, stop
+
+
+def overlaps(spans: list[tuple[str, str]], span: tuple[str, str]) -> bool:
+    start, stop = span
+    index = bisect_right(spans, (start, "\uffff"))
+    if index and (spans[index - 1][1] > start or spans[index - 1][0] == start):
+        return True
+    return index < len(spans) and spans[index][0] < stop
+
+
+def add_spans(spans: list[tuple[str, str]], new: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for start, stop in sorted(spans + new):
+        if result and start < result[-1][1]:
+            if stop > result[-1][1]:
+                result[-1] = (result[-1][0], stop)
+        else:
+            result.append((start, stop))
+    return result
+
+
+def is_preferred_source(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return bool(PREFERRED_EPG_HOST) and (host == PREFERRED_EPG_HOST or host.endswith("." + PREFERRED_EPG_HOST))
+
+
 class CountingWriter:
     def __init__(self, wrapped):
         self.wrapped = wrapped
@@ -648,8 +685,10 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
     seen_channels: set[str] = set()
     seen_programmes: set[tuple[str, str, str] | tuple[str, str]] = set()
     programme_channels: set[str] = set()
+    coverage: dict[str, list[tuple[str, str]]] = {}
     total_prog = 0
     duplicate_prog = 0
+    overlap_prog = 0
 
     for root in roots:
         # Carry over root-level attributes from the first source that defines them
@@ -672,8 +711,10 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
                 channel_elems.append(ch)
                 seen_channels.add(cid)
 
+        added: dict[str, list[tuple[str, str]]] = {}
         for prog in root.findall("programme"):
-            if prog.get("channel", "").strip() not in tvg_ids:
+            channel = prog.get("channel", "").strip()
+            if channel not in tvg_ids:
                 continue
 
             key = programme_key(prog)
@@ -681,10 +722,20 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
                 duplicate_prog += 1
                 continue
 
+            span = programme_span(prog)
+            if span is not None and overlaps(coverage.get(channel, []), span):
+                overlap_prog += 1
+                continue
+
             programme_elems.append(prog)
             seen_programmes.add(key)
-            programme_channels.add(prog.get("channel", "").strip())
+            programme_channels.add(channel)
+            if span is not None:
+                added.setdefault(channel, []).append(span)
             total_prog += 1
+
+        for channel, spans in added.items():
+            coverage[channel] = add_spans(coverage.get(channel, []), spans)
 
     for ch in channel_elems:
         merged.append(ch)
@@ -693,7 +744,8 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
 
     log.info(
         f"Merge complete — channels kept: {len(seen_channels)}/{len(tvg_ids)}, "
-        f"programme entries: {total_prog}, duplicate programmes skipped: {duplicate_prog}"
+        f"programme entries: {total_prog}, duplicate programmes skipped: {duplicate_prog}, "
+        f"overlapping programmes skipped: {overlap_prog}"
     )
 
     unmatched = tvg_ids - seen_channels
@@ -702,9 +754,9 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
     merge_summary = [
         "## Merge Result",
         "### Summary",
-        "| Channels | Unmatched | Matched | No Programme | Programmes | Duplicated Programmes |",
-        "|--------|--------|--------|--------|--------|------:|",
-        f"| {len(tvg_ids)} | {len(unmatched)} | {len(seen_channels)} | {len(channels_without_programmes)} | {total_prog} | {duplicate_prog} |",
+        "| Channels | Unmatched | Matched | No Programme | Programmes | Duplicated Programmes | Overlapping Programmes |",
+        "|--------|--------|--------|--------|--------|--------|------:|",
+        f"| {len(tvg_ids)} | {len(unmatched)} | {len(seen_channels)} | {len(channels_without_programmes)} | {total_prog} | {duplicate_prog} | {overlap_prog} |",
     ]
     release_note("\n".join(merge_summary))
 
@@ -871,7 +923,8 @@ def main() -> int:
         log.error(f"Only {fully_ok}/{len(results)} EPG sources fully OK (< {MIN_OK_RATIO:.0%}); not publishing a degraded EPG")
         return 1
 
-    roots = [result.root for result in results if result.root is not None]
+    ordered = sorted(results, key=lambda result: not is_preferred_source(result.url))
+    roots = [result.root for result in ordered if result.root is not None]
 
     if not roots:
         log.error("All EPG downloads failed")

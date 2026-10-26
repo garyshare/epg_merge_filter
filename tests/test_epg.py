@@ -149,6 +149,42 @@ class EpgTests(unittest.TestCase):
         self.assertEqual(len(merged.findall("programme")), 1)
         self.assertEqual(merged.find("programme/title").text, "Show")
 
+    def test_overlapping_programmes_from_later_sources_are_dropped(self):
+        first = epg.ET.fromstring(
+            '<tv><programme channel="demo" start="20261025120000 +0000" stop="20261025130000 +0000"><title>A</title></programme>'
+            '<programme channel="demo" start="20261025130000 +0000" stop="20261025140000 +0000"><title>B</title></programme></tv>'
+        )
+        second = epg.ET.fromstring(
+            '<tv><programme channel="demo" start="20261025120500 +0000" stop="20261025125500 +0000"><title>Inside</title></programme>'
+            '<programme channel="demo" start="20261025135900 +0000" stop="20261025150000 +0000"><title>Straddle</title></programme>'
+            '<programme channel="demo" start="20261025140000 +0000" stop="20261025150000 +0000"><title>After</title></programme>'
+            '<programme channel="demo" start="20261025110000 +0000" stop="20261025120000 +0000"><title>Before</title></programme>'
+            '<programme channel="other" start="20261025120000 +0000" stop="20261025130000 +0000"><title>Other</title></programme></tv>'
+        )
+        merged = epg.merge_epg([first, second], {"demo", "other"})
+        self.assertEqual(
+            [programme.find("title").text for programme in merged.findall("programme")],
+            ["A", "B", "After", "Before", "Other"],
+        )
+
+    def test_preferred_source_wins_regardless_of_playlist_order(self):
+        playlist = (
+            '#EXTM3U\n## url-tvg="https://other.invalid/epg,https://epgshare01.online/epgshare01/all.xml"\n'
+            '#EXTINF:-1 tvg-id="demo",Demo\nhttps://example.invalid/live\n'
+        )
+        bodies = {
+            "https://other.invalid/epg": b'<tv><programme channel="demo" start="20261025120500 +0000" stop="20261025125500 +0000"><title>Other</title></programme></tv>',
+            "https://epgshare01.online/epgshare01/all.xml": b'<tv><channel id="demo"/><programme channel="demo" start="20261025120000 +0000" stop="20261025130000 +0000"><title>Share</title></programme></tv>',
+        }
+
+        def get(url, **kwargs):
+            return Response(playlist.encode() if url == epg.M3U_URL else bodies[url])
+
+        with patch.object(epg, "cf_requests", SimpleNamespace(get=get)):
+            self.assertEqual(epg.main(), 0)
+        root = epg.ET.fromstring(gzip.decompress(self.output.read_bytes()))
+        self.assertEqual([programme.find("title").text for programme in root.findall("programme")], ["Share"])
+
     def test_source_success_ratio_still_blocks_degraded_guides(self):
         urls = [f"https://example.invalid/{index}" for index in range(4)]
         playlist = PLAYLIST.replace("https://example.invalid/epg", ",".join(urls))

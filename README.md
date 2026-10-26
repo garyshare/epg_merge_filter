@@ -10,7 +10,8 @@ Fetches EPG (XMLTV) sources declared in an M3U playlist, merges them into a sing
 1. **Parse M3U** — reads `url-tvg` / `tvg-id` attributes from an M3U playlist supplied via the `M3U_URL` secret (or a manual override).
 2. **Fetch EPG sources concurrently** — downloads each XMLTV URL in parallel (configurable worker count and timeout) using [`curl-cffi`](https://github.com/lexiforest/curl_cffi), which replicates a real browser's TLS/HTTP2 fingerprint to bypass Cloudflare Bot Management without a headless browser.
 3. **Merge & deduplicate** — combines `<channel>` and `<programme>` elements across all sources, dropping duplicates keyed on channel ID.
-4. **Validate & publish** — refuses to publish an empty guide, then uploads `output/merged_epg.xml.gz` to a new draft Release. Only a successful upload is published and marked as latest, preserving the previous download when an upload fails. After publishing, every other release (including drafts left by failed uploads) and every other tag is deleted, so only one release and one tag exist at any time.
+4. **Resolve overlaps** — sources whose host matches `PREFERRED_EPG_HOST` (default `epgshare01.online`) are merged first. For each channel, a programme from a later source is dropped when its time range overlaps a programme already kept from an earlier source.
+5. **Validate & publish** — refuses to publish an empty guide, then uploads `output/merged_epg.xml.gz` to a new draft Release. Only a successful upload is published and marked as latest, preserving the previous download when an upload fails. After publishing, every other release (including drafts left by failed uploads) and every other tag is deleted, so only one release and one tag exist at any time.
 
 ## Download
 
@@ -43,7 +44,7 @@ The original M3U parsing rules are preserved: EPG source attributes are read fro
 The workflow (`Merge EPG`) can be triggered three ways:
 
 - **Push** — automatically on `main` commits that modify `scripts/epg.py`, `scripts/publish_release.sh`, or `.github/workflows/epg.yml`.
-- **Schedule** — runs every hour at minute 17, approximately 720 scheduled runs per 30-day month.
+- **Schedule** — runs every 4 hours at minute 17 (UTC 00:17, 04:17, … 20:17), approximately 180 scheduled runs per 30-day month.
 - **Manual** — use *Actions → Merge EPG → Run workflow*, optionally overriding `m3u_url` and `impersonate`.
 
 ## Requirements

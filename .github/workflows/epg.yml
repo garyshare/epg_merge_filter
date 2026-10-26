@@ -4,7 +4,7 @@ on:
   # 定时全自动运行（GitHub 使用 UTC 时间）
   schedule:
     # 分钟数错开整点：GitHub 在整点高峰会延迟甚至丢弃定时任务
-    - cron: "17 * * * *"
+    - cron: "17 */4 * * *"
 
   # 保留手动触发按钮（随时想更新可以在网页上点 Run workflow）
   workflow_dispatch:
