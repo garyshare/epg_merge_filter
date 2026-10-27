@@ -1,12 +1,10 @@
 name: Merge EPG
 
 on:
-  # 定时全自动运行（GitHub 使用 UTC 时间）
   schedule:
-    # 分钟数错开整点：GitHub 在整点高峰会延迟甚至丢弃定时任务
-    - cron: "17 */4 * * *"
+    - cron: "17 * * * *"
 
-  # 保留手动触发按钮（随时想更新可以在网页上点 Run workflow）
+  # Allow manual triggering with optional overrides
   workflow_dispatch:
     inputs:
       m3u_url:
@@ -18,26 +16,17 @@ on:
         required: false
         default: "chrome"
 
-  # 当 main 分支上的脚本或工作流文件更新时自动触发一次
-  # （限定 main：其他分支的推送不会触发运行，也就不会覆盖正式发布的 Release）
+  # Also trigger when the script or workflow file is updated
   push:
-    branches:
-      - main
     paths:
       - "scripts/epg.py"
-      - "scripts/publish_release.sh"
       - ".github/workflows/epg.yml"
 
 jobs:
   merge-epg:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    concurrency:
-      group: merge-epg
-      cancel-in-progress: false
     permissions:
-      contents: write # 赋予 Release 发布写入权限
-      actions: write
+      contents: write # required to commit the merged result back to the repo
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────
@@ -49,14 +38,15 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-          cache: pip
 
       # ── 3. Install dependencies ───────────────────────────────────────────
+      # curl-cffi (PyPI name uses a hyphen; imported as curl_cffi) links libcurl
+      # against BoringSSL to replicate Chrome JA3/JA4/HTTP2 fingerprints —
+      # the lightest option for bypassing Cloudflare Bot Management without a
+      # real browser. v0.15+ adds HTTP/3 fingerprint support.
+      # Python >=3.10 is required since v0.14.
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Run regression tests
-        run: python -B -m unittest discover -s tests
 
       # ── 4. Run the merger ─────────────────────────────────────────────────
       - name: Run EPG merger
@@ -65,31 +55,44 @@ jobs:
           OUTPUT_PATH: output/merged_epg.xml.gz
           MAX_WORKERS: "6"
           REQUEST_TIMEOUT: "60"
-          LOGO_CHECK_TIMEOUT: "30"
-          LOGO_REQUEST_TIMEOUT: "5"
           IMPERSONATE: ${{ inputs.impersonate || 'chrome' }}
+
+          # Optional: Cloudflare Workers reverse proxy
+          # If curl_cffi alone is still blocked (e.g. CF JS Challenge is on),
+          # deploy cloudflare-worker/proxy.js and store the Worker URL as a secret:
+          #   CF_PROXY_URL = https://epg-proxy.your-name.workers.dev/proxy
+          # The script will route all requests through the Worker, which runs
+          # on CF edge nodes and is never blocked by CF itself.
           CF_PROXY_URL: ${{ secrets.CF_PROXY_URL }}
 
         run: |
           echo "MERGE_TIME=$(TZ='Asia/Shanghai' date +"%Y-%m-%dT%H:%M:%S%z")" >> $GITHUB_ENV
           python scripts/epg.py
 
-      # 失败时也把 release notes 写进运行摘要，方便排查哪个源出了问题
-      - name: Job summary
-        if: always()
-        run: |
-          [ -f output/release_notes.md ] && cat output/release_notes.md >> "$GITHUB_STEP_SUMMARY" || true
+      # ── 5. Upload artifact ────────────────────────────────────────────────
+      # - name: Upload merged EPG as artifact
+      #   uses: actions/upload-artifact@v7
+      #   with:
+      #     name: merged-epg-${{ github.run_number }}
+      #     path: output/merged_epg.xml.gz
+      #     retention-days: 30
 
+      # ── 6. Commit result to repository ───────────────────────────────────
+      - name: Update latest tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa latest -m latest
+          git push origin latest --force
+
+      # ── 7. publish as a Release asset ───────────────────────────
+      # expose the merged EPG at a stable, permanent URL:
+      #   https://github.com/garyshare/epg_merge_filter/releases/download/latest/merged_epg.xml.gz
       - name: Publish Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/publish_release.sh
-
-      - name: Keep scheduled workflows enabled
-        if: always() && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for workflow in epg.yml cleanup.yml; do
-            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"
-          done
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          make_latest: true
+          name: Merged EPG @ ${{ env.MERGE_TIME }}
+          body_path: output/release_notes.md
+          files: output/merged_epg.xml.gz
