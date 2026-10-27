@@ -1,0 +1,43 @@
+name: Keepalive
+
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/keepalive.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epg-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Keep scheduled workflows active
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          last_commit=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if (( now - last_commit < 30 * 86400 )); then
+            echo "Repository activity is recent; no keepalive commit needed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keep scheduled workflows active"
+          git push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"

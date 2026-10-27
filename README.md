@@ -49,3 +49,7 @@ The workflow (`Merge EPG`) can be triggered three ways:
 ## License
 
 Apache 2.0
+
+## Keepalive
+
+The Keepalive workflow checks the default branch daily at 02:37 UTC (10:37 Asia/Shanghai). If there have been no commits for 30 days, it creates and pushes an empty commit to keep scheduled workflows active. Recent activity causes the check to exit without a commit. No EPG files or merger logic are changed.
